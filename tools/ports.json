@@ -29,5 +29,15 @@
     "alpine": "lua5.4",
     "branch": "edge",
     "repo": "main"
+  },
+  "less": {
+    "alpine": "less",
+    "branch": "edge",
+    "repo": "main"
+  },
+  "sqlite3": {
+    "alpine": "sqlite",
+    "branch": "edge",
+    "repo": "main"
   }
 }

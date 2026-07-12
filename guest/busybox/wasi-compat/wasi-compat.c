@@ -229,3 +229,12 @@ int system(const char *cmd) {
     errno = ENOSYS;
     return -1;
 }
+
+/* pclose: wasi-libc oddly ships a popen symbol but no pclose, so programs whose
+ * popen paths are compiled out can still reference pclose from shared cleanup
+ * code (first consumer: less's close_pipe). Nothing can have been popen'd. */
+int pclose(FILE *f) {
+    (void)f;
+    errno = ENOSYS;
+    return -1;
+}
