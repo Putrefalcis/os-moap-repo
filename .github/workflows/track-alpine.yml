@@ -121,7 +121,7 @@ jobs:
       - uses: actions/setup-node@v4
         if: steps.gate.outputs.ready == 'true' && steps.oracle.outputs.bumps != '[]'
         with:
-          node-version: 22
+          node-version: 24
 
       - name: rebuild bumped ports + smoke + publish
         if: steps.gate.outputs.ready == 'true' && steps.oracle.outputs.bumps != '[]'
@@ -137,7 +137,8 @@ jobs:
               if OSD_PKG_VER="$VER" bash guest/pkgs/ncurses/build.sh && \
                  OSD_PKG_VER="$VER" bash guest/pkgs/nano/build.sh && \
                  OSD_PKG_VER="$VER" bash guest/pkgs/nano/package.sh; then
-                OUT=$(cd web/wasi && echo q | OSD_WASM=../../guest/pkgs/nano.wasm node --experimental-wasm-jspi run-node.mjs nano --version 2>&1 || true)
+                JF=""; node -e 'process.exit(typeof WebAssembly.Suspending=="function"?0:1)' || JF="--experimental-wasm-jspi"
+                OUT=$(cd web/wasi && echo q | OSD_WASM=../../guest/pkgs/nano.wasm node $JF run-node.mjs nano --version 2>&1 || true)
                 echo "$OUT" | grep -q "version $VER" || { echo "::error::$NAME smoke failed: $OUT"; FAILED=1; continue; }
                 python3 tools/pack_repo.py --repo "$GITHUB_WORKSPACE/repo" \
                   --name nano --ver "$VER-r0" \
