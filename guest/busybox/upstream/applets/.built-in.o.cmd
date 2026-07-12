@@ -1,1 +1,0 @@
-cmd_applets/built-in.o :=  /home/runner/work/os-moap-repo/os-moap-repo/guest/../build/wasi-sdk/bin/clang -nostdlib -nostdlib -lwasi-emulated-mman -lwasi-emulated-signal -lwasi-emulated-process-clocks -lwasi-emulated-getpid -mexec-model=command -L/home/runner/work/os-moap-repo/os-moap-repo/guest/busybox/wasi-compat -lwasicompat -lsetjmp -r -o applets/built-in.o applets/applets.o
