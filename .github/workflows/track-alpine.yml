@@ -1,0 +1,173 @@
+# track-alpine: the wasm32-wasip1 port follows Alpine.
+#
+# Weekly (or on dispatch), parse Alpine's APKINDEX as a VERSION ORACLE (never a
+# binary source -- Alpine ships no wasm arch) for every package in the source
+# repo's tools/ports.json. When Alpine's upstream version is NEWER than ours,
+# rebuild from upstream source with the OS-MOAP recipes, smoke-test the wasm,
+# publish blob + reindex, push. Build/smoke failure -> issue; old version keeps
+# serving.
+#
+# Needs (one-time setup):
+#   secret OSD_SRC_TOKEN  fine-grained PAT, contents:read on the source repo
+#   vars OSD_SRC_REPO / OSD_SRC_REF   (default Putrefalcis/wideband-scanner @
+#                                      empirical-hardening; OS-MOAP/ subdir)
+# Until the secret exists the job exits neutral (no red crons).
+name: track-alpine
+on:
+  schedule:
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'package name: rebuild+publish even without an Alpine bump'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  track:
+    runs-on: ubuntu-latest
+    env:
+      SRC_REPO: ${{ vars.OSD_SRC_REPO || 'Putrefalcis/wideband-scanner' }}
+      SRC_REF: ${{ vars.OSD_SRC_REF || 'empirical-hardening' }}
+      FORCE: ${{ inputs.force || '' }}
+    steps:
+      - name: gate on setup
+        id: gate
+        run: |
+          if [ -z "${{ secrets.OSD_SRC_TOKEN }}" ]; then
+            echo "OSD_SRC_TOKEN not configured -- tracker dormant." >> "$GITHUB_STEP_SUMMARY"
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.ready == 'true'
+        with:
+          path: repo
+
+      - name: clone OS-MOAP sources
+        if: steps.gate.outputs.ready == 'true'
+        run: |
+          git clone --depth 1 --branch "$SRC_REF" \
+            "https://x-access-token:${{ secrets.OSD_SRC_TOKEN }}@github.com/$SRC_REPO.git" src
+          test -d src/OS-MOAP || { echo "::error::OS-MOAP/ not in $SRC_REPO@$SRC_REF -- push the sources first"; exit 1; }
+
+      - name: version oracle (Alpine APKINDEX) -> bump list
+        if: steps.gate.outputs.ready == 'true'
+        id: oracle
+        run: |
+          python3 - <<'EOF'
+          import json, os, re, tarfile, urllib.request, io
+
+          ports = json.load(open('src/OS-MOAP/tools/ports.json'))
+          ours = {p['name']: p['ver'] for p in json.load(open('repo/APKINDEX.json'))['pkgs']}
+          force = os.environ.get('FORCE', '')
+
+          def vercmp(a, b):  # mirror of tools/pack_repo.py
+              sa, sb = re.split(r'[.\-]', a), re.split(r'[.\-]', b)
+              for i in range(max(len(sa), len(sb))):
+                  x = sa[i] if i < len(sa) else ''
+                  y = sb[i] if i < len(sb) else ''
+                  if x == y: continue
+                  if x.isdigit() and y.isdigit(): return -1 if int(x) < int(y) else 1
+                  return -1 if x < y else 1
+              return 0
+
+          def upstream(v):  # strip the -rN packaging revision
+              return re.sub(r'-r\d+$', '', v)
+
+          bumps = []
+          for name, cfg in ports.items():
+              if name.startswith('_'): continue
+              url = (f"https://dl-cdn.alpinelinux.org/alpine/{cfg['branch']}"
+                     f"/{cfg['repo']}/x86_64/APKINDEX.tar.gz")
+              data = urllib.request.urlopen(url, timeout=60).read()
+              with tarfile.open(fileobj=io.BytesIO(data)) as t:
+                  text = t.extractfile('APKINDEX').read().decode()
+              m = re.search(rf"^P:{re.escape(cfg['alpine'])}\nV:([^\n]+)", text, re.M)
+              if not m:
+                  print(f"::warning::{name}: {cfg['alpine']} not in Alpine {cfg['branch']}/{cfg['repo']}")
+                  continue
+              alpine_up = upstream(m.group(1))
+              our_up = upstream(ours.get(name, '0'))
+              print(f"{name}: alpine {alpine_up}  ours {our_up}")
+              if name == force or vercmp(alpine_up, our_up) > 0:
+                  bumps.append({'name': name, 'ver': alpine_up})
+          if force and not any(b['name'] == force for b in bumps):
+              bumps.append({'name': force, 'ver': upstream(ours.get(force, '0'))})
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"bumps={json.dumps(bumps)}\n")
+          print('bumps:', bumps)
+          EOF
+
+      - name: install wasi-sdk + node
+        if: steps.gate.outputs.ready == 'true' && steps.oracle.outputs.bumps != '[]'
+        run: |
+          SDK_VER=33
+          curl -fsSL -o /tmp/sdk.tar.gz \
+            "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-$SDK_VER/wasi-sdk-$SDK_VER.0-x86_64-linux.tar.gz"
+          mkdir -p src/OS-MOAP/build
+          tar xzf /tmp/sdk.tar.gz -C src/OS-MOAP/build
+          mv src/OS-MOAP/build/wasi-sdk-$SDK_VER.0-x86_64-linux src/OS-MOAP/build/wasi-sdk
+          sudo apt-get install -y ncurses-term
+          cp /usr/share/terminfo/x/xterm src/OS-MOAP/guest/pkgs/terminfo-xterm || \
+            cp /lib/terminfo/x/xterm src/OS-MOAP/guest/pkgs/terminfo-xterm
+      - uses: actions/setup-node@v4
+        if: steps.gate.outputs.ready == 'true' && steps.oracle.outputs.bumps != '[]'
+        with:
+          node-version: 22
+
+      - name: rebuild bumped ports + smoke + publish
+        if: steps.gate.outputs.ready == 'true' && steps.oracle.outputs.bumps != '[]'
+        run: |
+          set -uo pipefail
+          cd src/OS-MOAP
+          bash guest/build.sh                       # busybox: run-node's interpreter
+          FAILED=0
+          for row in $(echo '${{ steps.oracle.outputs.bumps }}' | python3 -c "import json,sys; [print(b['name']+'='+b['ver']) for b in json.load(sys.stdin)]"); do
+            NAME="${row%%=*}"; VER="${row##*=}"
+            echo "=== $NAME $VER ==="
+            if [ "$NAME" = nano ]; then
+              if OSD_PKG_VER="$VER" bash guest/pkgs/ncurses/build.sh && \
+                 OSD_PKG_VER="$VER" bash guest/pkgs/nano/build.sh && \
+                 OSD_PKG_VER="$VER" bash guest/pkgs/nano/package.sh; then
+                OUT=$(cd web/wasi && echo q | OSD_WASM=../../guest/pkgs/nano.wasm node run-node.mjs nano --version 2>&1 || true)
+                echo "$OUT" | grep -q "version $VER" || { echo "::error::$NAME smoke failed: $OUT"; FAILED=1; continue; }
+                python3 tools/pack_repo.py --repo "$GITHUB_WORKSPACE/repo" \
+                  --name nano --ver "$VER-r0" \
+                  --desc "small, friendly text editor (GNU nano)" --dir guest/pkgs/nano/stage
+              else
+                echo "::error::$NAME $VER build failed"; FAILED=1; continue
+              fi
+            else
+              echo "::warning::$NAME: no CI recipe wired yet, skipping"; continue
+            fi
+          done
+          echo "FAILED=$FAILED" >> "$GITHUB_ENV"
+
+      - name: push published bumps
+        if: steps.gate.outputs.ready == 'true' && steps.oracle.outputs.bumps != '[]'
+        run: |
+          cd repo
+          git config user.name 'os-moap-tracker'
+          git config user.email 'tracker@os-moap.invalid'
+          git add -A
+          git diff --cached --quiet && { echo "nothing published"; exit 0; }
+          git commit -m "track-alpine: $(git diff --cached --name-only | grep tar.gz | tr '\n' ' ')"
+          git push
+          echo "published: $(git log -1 --oneline)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: open issue on failure
+        if: steps.gate.outputs.ready == 'true' && env.FAILED == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create -R "$GITHUB_REPOSITORY" \
+            -t "track-alpine: port build failed ($(date -u +%F))" \
+            -b "A tracked package bumped in Alpine but the wasm port build or smoke failed. See the run log: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID -- fix the recipe in the source repo, then re-dispatch with force=<pkg>. The old version keeps serving meanwhile."
