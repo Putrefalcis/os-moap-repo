@@ -108,6 +108,8 @@ static void pump_input(uint32_t now)
     int c;
     while ((c = rd_byte(0)) >= 0) {
 	unsigned char k = 0;
+	if (c == 0x03)		/* ^C: quit like a terminal program should */
+	    exit(0);		/* atexit restores the screen */
 	if (c == 0x1b) {
 	    int c2 = rd_byte(5);              /* lone ESC vs CSI sequence */
 	    if (c2 < 0) k = KEY_ESCAPE;
@@ -183,6 +185,9 @@ void DG_Init(void)
 
     tcgetattr(0, &t);
     cfmakeraw(&t);
+    /* explicit: the page's line discipline keys ONLY on ICANON -- make the
+     * intent unmissable whatever a libc's cfmakeraw does */
+    t.c_lflag &= ~(ICANON | ECHO | ISIG);
     tcsetattr(0, TCSANOW, &t);
     atexit(screen_restore);
     (void)!write(1, "\x1b[?1049h\x1b[?25l\x1b[2J", 18);

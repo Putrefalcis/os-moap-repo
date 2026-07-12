@@ -52,7 +52,19 @@ WEAK int tcsetattr(int fd, int a, const struct termios *t) {
 }
 WEAK int tcflush(int fd, int q) { (void)fd;(void)q; return 0; }
 WEAK int tcdrain(int fd) { (void)fd; return 0; }
-WEAK void cfmakeraw(struct termios *t) { (void)t; }
+/* cfmakeraw: the REAL flag surgery (was a no-op stub -- doom's get-cfmakeraw-set
+ * left ICANON|ECHO intact, so the tty never went raw for anyone relying on it;
+ * ncurses never noticed because it clears the flags manually). */
+WEAK void cfmakeraw(struct termios *t) {
+    if (!t) return;
+    t->c_iflag &= ~(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL | IXON);
+    t->c_oflag &= ~OPOST;
+    t->c_lflag &= ~(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
+    t->c_cflag &= ~(CSIZE | PARENB);
+    t->c_cflag |= CS8;
+    t->c_cc[VMIN] = 1;
+    t->c_cc[VTIME] = 0;
+}
 WEAK speed_t cfgetispeed(const struct termios *t) { (void)t; return 0; }
 WEAK speed_t cfgetospeed(const struct termios *t) { (void)t; return 0; }
 WEAK int cfsetispeed(struct termios *t, speed_t s) { (void)t;(void)s; return 0; }
