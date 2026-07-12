@@ -67,9 +67,11 @@ FLAGS="--target=wasm32-wasip1 --sysroot=$SDK/share/wasi-sysroot -I$STUBS -I$P/nc
   CFLAGS="$FLAGS -O2 -mllvm -wasm-enable-sjlj -Wno-error=implicit-function-declaration" \
   LDFLAGS="-L$P/ncurses-build/lib -L$COMPAT -lsetjmp -lwasi-emulated-signal -lwasi-emulated-process-clocks -lwasi-emulated-getpid -Wl,--wrap,fcntl -Wl,-z,stack-size=1048576" \
   LIBS="-lwasicompat" AR="$SDK/bin/llvm-ar" RANLIB="$SDK/bin/llvm-ranlib" \
-  ac_cv_func_getrusage=no \
+  ac_cv_func_getrusage=no ac_cv_func_link=no \
   --disable-dynamic --disable-gdbm --disable-pcre --disable-cap \
   --disable-locale --enable-multibyte --disable-dynamic-nss --with-term-lib=ncursesw
+# link=no: wasi has no hardlinks; zsh's symlink-based history locking is gated
+# on a link()-having host, and this flips it to open(O_EXCL) locking (works).
 # rlimits module: its awk-generated resource tables come out empty on wasi
 sed -i 's|name=zsh/rlimits modfile=Src/Builtins/rlimits.mdd link=static auto=yes load=yes|name=zsh/rlimits modfile=Src/Builtins/rlimits.mdd link=no auto=yes load=no|' config.modules
 make -j"$(nproc)"
@@ -85,6 +87,15 @@ cat > "$STAGE/etc/zshenv" <<'EOF'
 # `> a > b` is last-wins here (like bash). Everything else that needs a real
 # subprocess (&, (...), <(...), =(...), coproc) reports "fork failed".
 setopt NO_MULTIOS
+EOF
+cat > "$STAGE/etc/zshrc" <<'EOF'
+# OS-MOAP defaults for interactive zsh (override in ~/.zshrc).
+# /home is LinksetData-synced: your prompt history survives reboots.
+PS1='%F{cyan}%~%f %# '
+HISTFILE=~/.zsh_history
+HISTSIZE=200
+SAVEHIST=200
+setopt SHARE_HISTORY
 EOF
 python3 "$ROOT/tools/pack_pkg.py" --name zsh --ver "$VER-r${OSD_PKG_REV:-0}" \
   --desc "the Z shell (zle, no-fork wasm port)" --dir "$STAGE"
