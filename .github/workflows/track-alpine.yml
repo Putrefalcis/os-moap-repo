@@ -133,21 +133,16 @@ jobs:
           for row in $(echo '${{ steps.oracle.outputs.bumps }}' | python3 -c "import json,sys; [print(b['name']+'='+b['ver']) for b in json.load(sys.stdin)]"); do
             NAME="${row%%=*}"; VER="${row##*=}"
             echo "=== $NAME $VER ==="
-            if [ "$NAME" = nano ]; then
-              if OSD_PKG_VER="$VER" bash guest/pkgs/ncurses/build.sh && \
-                 OSD_PKG_VER="$VER" bash guest/pkgs/nano/build.sh && \
-                 OSD_PKG_VER="$VER" bash guest/pkgs/nano/package.sh; then
-                JF=""; node -e 'process.exit(typeof WebAssembly.Suspending=="function"?0:1)' || JF="--experimental-wasm-jspi"
-                OUT=$(cd web/wasi && echo q | OSD_WASM=../../guest/pkgs/nano.wasm node $JF run-node.mjs nano --version 2>&1 || true)
-                echo "$OUT" | grep -q "version $VER" || { echo "::error::$NAME smoke failed: $OUT"; FAILED=1; continue; }
-                python3 tools/pack_repo.py --repo "$GITHUB_WORKSPACE/repo" \
-                  --name nano --ver "$VER-r0" \
-                  --desc "small, friendly text editor (GNU nano)" --dir guest/pkgs/nano/stage
-              else
-                echo "::error::$NAME $VER build failed"; FAILED=1; continue
-              fi
+            # ci_build.sh builds + smokes the port (logic versioned in the source repo,
+            # not this YAML) and leaves a stage/ for pack_repo. Non-zero = build/smoke
+            # failed -> issue + old version keeps serving.
+            if bash tools/ci_build.sh "$NAME" "$VER"; then
+              DESC=$(python3 -c "import json; d=json.load(open('$GITHUB_WORKSPACE/repo/APKINDEX.json')); print(next((p['desc'] for p in d['pkgs'] if p['name']=='$NAME'), '$NAME'))")
+              python3 tools/pack_repo.py --repo "$GITHUB_WORKSPACE/repo" \
+                --name "$NAME" --ver "$VER-r0" --desc "$DESC" --dir "guest/pkgs/$NAME/stage" \
+                || { echo "::error::$NAME pack_repo failed"; FAILED=1; }
             else
-              echo "::warning::$NAME: no CI recipe wired yet, skipping"; continue
+              echo "::error::$NAME $VER build/smoke failed"; FAILED=1
             fi
           done
           echo "FAILED=$FAILED" >> "$GITHUB_ENV"
