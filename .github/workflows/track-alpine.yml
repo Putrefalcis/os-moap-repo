@@ -31,8 +31,8 @@ jobs:
   track:
     runs-on: ubuntu-latest
     env:
-      SRC_REPO: ${{ vars.OSD_SRC_REPO || 'Putrefalcis/wideband-scanner' }}
-      SRC_REF: ${{ vars.OSD_SRC_REF || 'empirical-hardening' }}
+      SRC_REPO: ${{ vars.OSD_SRC_REPO || 'Putrefalcis/os-moap' }}
+      SRC_REF: ${{ vars.OSD_SRC_REF || 'main' }}
       FORCE: ${{ inputs.force || '' }}
     steps:
       - name: gate on setup
@@ -55,7 +55,7 @@ jobs:
         run: |
           git clone --depth 1 --branch "$SRC_REF" \
             "https://x-access-token:${{ secrets.OSD_SRC_TOKEN }}@github.com/$SRC_REPO.git" src
-          test -d src/OS-MOAP || { echo "::error::OS-MOAP/ not in $SRC_REPO@$SRC_REF -- push the sources first"; exit 1; }
+          test -f src/tools/ports.json || { echo "::error::tools/ports.json not in $SRC_REPO@$SRC_REF"; exit 1; }
 
       - name: version oracle (Alpine APKINDEX) -> bump list
         if: steps.gate.outputs.ready == 'true'
@@ -64,7 +64,7 @@ jobs:
           python3 - <<'EOF'
           import json, os, re, tarfile, urllib.request, io
 
-          ports = json.load(open('src/OS-MOAP/tools/ports.json'))
+          ports = json.load(open('src/tools/ports.json'))
           ours = {p['name']: p['ver'] for p in json.load(open('repo/APKINDEX.json'))['pkgs']}
           force = os.environ.get('FORCE', '')
 
@@ -112,12 +112,12 @@ jobs:
           SDK_VER=33
           curl -fsSL -o /tmp/sdk.tar.gz \
             "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-$SDK_VER/wasi-sdk-$SDK_VER.0-x86_64-linux.tar.gz"
-          mkdir -p src/OS-MOAP/build
-          tar xzf /tmp/sdk.tar.gz -C src/OS-MOAP/build
-          mv src/OS-MOAP/build/wasi-sdk-$SDK_VER.0-x86_64-linux src/OS-MOAP/build/wasi-sdk
+          mkdir -p src/build
+          tar xzf /tmp/sdk.tar.gz -C src/build
+          mv src/build/wasi-sdk-$SDK_VER.0-x86_64-linux src/build/wasi-sdk
           sudo apt-get install -y ncurses-term
-          cp /usr/share/terminfo/x/xterm src/OS-MOAP/guest/pkgs/terminfo-xterm || \
-            cp /lib/terminfo/x/xterm src/OS-MOAP/guest/pkgs/terminfo-xterm
+          cp /usr/share/terminfo/x/xterm src/guest/pkgs/terminfo-xterm || \
+            cp /lib/terminfo/x/xterm src/guest/pkgs/terminfo-xterm
       - uses: actions/setup-node@v4
         if: steps.gate.outputs.ready == 'true' && steps.oracle.outputs.bumps != '[]'
         with:
@@ -127,7 +127,7 @@ jobs:
         if: steps.gate.outputs.ready == 'true' && steps.oracle.outputs.bumps != '[]'
         run: |
           set -uo pipefail
-          cd src/OS-MOAP
+          cd src
           bash guest/build.sh                       # busybox: run-node's interpreter
           FAILED=0
           for row in $(echo '${{ steps.oracle.outputs.bumps }}' | python3 -c "import json,sys; [print(b['name']+'='+b['ver']) for b in json.load(sys.stdin)]"); do
