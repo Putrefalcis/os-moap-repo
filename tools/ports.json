@@ -1,0 +1,33 @@
+{
+  "_doc": "Which OS-MOAP packages track an Alpine upstream (version ORACLE only -- Alpine ships no wasm binaries; we rebuild from upstream source with guest/pkgs/<name>/build.sh). Consumed by os-moap-repo's track-alpine workflow. Untracked local ports: hello, shellver, webby, curses-smoke. ncurses is a static build-dep of nano/sl, not published; manual bumps.",
+  "nano": {
+    "alpine": "nano",
+    "branch": "edge",
+    "repo": "main"
+  },
+  "tree": {
+    "alpine": "tree",
+    "branch": "edge",
+    "repo": "main"
+  },
+  "figlet": {
+    "alpine": "figlet",
+    "branch": "edge",
+    "repo": "community"
+  },
+  "sl": {
+    "alpine": "sl",
+    "branch": "edge",
+    "repo": "community"
+  },
+  "jq": {
+    "alpine": "jq",
+    "branch": "edge",
+    "repo": "main"
+  },
+  "lua": {
+    "alpine": "lua5.4",
+    "branch": "edge",
+    "repo": "main"
+  }
+}

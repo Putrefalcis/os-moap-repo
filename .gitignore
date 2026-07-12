@@ -1,0 +1,22 @@
+# build artifacts (CI regenerates them; recipes reproduce them)
+build/
+__pycache__/
+guest/busybox-v0.wasm
+guest/pkgs/*-upstream/
+guest/pkgs/*-build/
+guest/pkgs/*/stage/
+guest/pkgs/sysroot/
+guest/pkgs/terminfo-xterm
+guest/pkgs/*.wasm
+guest/pkgs/*.tar.*
+guest/busybox/upstream/**/*.o
+guest/busybox/upstream/**/*.a
+guest/busybox/upstream/**/*.s
+guest/busybox/upstream/.config*
+guest/busybox/upstream/.depend
+guest/busybox/upstream/busybox
+guest/busybox/upstream/busybox_unstripped*
+guest/busybox/upstream/include/autoconf.h
+guest/busybox/upstream/include/config/
+guest/busybox/wasi-compat/*.o
+guest/busybox/wasi-compat/*.a

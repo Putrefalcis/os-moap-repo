@@ -1,17 +1,14 @@
 # track-alpine: the wasm32-wasip1 port follows Alpine.
 #
-# Weekly (or on dispatch), parse Alpine's APKINDEX as a VERSION ORACLE (never a
-# binary source -- Alpine ships no wasm arch) for every package in the source
-# repo's tools/ports.json. When Alpine's upstream version is NEWER than ours,
-# rebuild from upstream source with the OS-MOAP recipes, smoke-test the wasm,
-# publish blob + reindex, push. Build/smoke failure -> issue; old version keeps
-# serving.
+# This repo is self-contained (recipes + busybox + packers + mirror), so the job
+# builds and publishes from its OWN checkout with the default GITHUB_TOKEN -- no
+# cross-repo secret / PAT. Weekly (or on dispatch) it parses Alpine's APKINDEX as a
+# VERSION ORACLE (never a binary source -- Alpine ships no wasm arch), rebuilds any
+# port whose upstream version bumped, smoke-permitting-publishes, and commits the
+# blob. A build failure opens an issue and the old version keeps serving.
 #
-# Needs (one-time setup):
-#   secret OSD_SRC_TOKEN  fine-grained PAT, contents:read on the source repo
-#   vars OSD_SRC_REPO / OSD_SRC_REF   (default Putrefalcis/wideband-scanner @
-#                                      empirical-hardening; OS-MOAP/ subdir)
-# Until the secret exists the job exits neutral (no red crons).
+# The CI build is BUILD-ONLY (the WASI shim that runs the smoke lives in the private
+# product repo). Smoke new versions locally: `tools/ci_build.sh <name> <ver>` there.
 name: track-alpine
 on:
   schedule:
@@ -31,41 +28,18 @@ jobs:
   track:
     runs-on: ubuntu-latest
     env:
-      SRC_REPO: ${{ vars.OSD_SRC_REPO || 'Putrefalcis/os-moap' }}
-      SRC_REF: ${{ vars.OSD_SRC_REF || 'main' }}
       FORCE: ${{ inputs.force || '' }}
     steps:
-      - name: gate on setup
-        id: gate
-        run: |
-          if [ -z "${{ secrets.OSD_SRC_TOKEN }}" ]; then
-            echo "OSD_SRC_TOKEN not configured -- tracker dormant." >> "$GITHUB_STEP_SUMMARY"
-            echo "ready=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "ready=true" >> "$GITHUB_OUTPUT"
-          fi
-
       - uses: actions/checkout@v4
-        if: steps.gate.outputs.ready == 'true'
-        with:
-          path: repo
-
-      - name: clone OS-MOAP sources
-        if: steps.gate.outputs.ready == 'true'
-        run: |
-          git clone --depth 1 --branch "$SRC_REF" \
-            "https://x-access-token:${{ secrets.OSD_SRC_TOKEN }}@github.com/$SRC_REPO.git" src
-          test -f src/tools/ports.json || { echo "::error::tools/ports.json not in $SRC_REPO@$SRC_REF"; exit 1; }
 
       - name: version oracle (Alpine APKINDEX) -> bump list
-        if: steps.gate.outputs.ready == 'true'
         id: oracle
         run: |
           python3 - <<'EOF'
           import json, os, re, tarfile, urllib.request, io
 
-          ports = json.load(open('src/tools/ports.json'))
-          ours = {p['name']: p['ver'] for p in json.load(open('repo/APKINDEX.json'))['pkgs']}
+          ports = json.load(open('tools/ports.json'))
+          ours = {p['name']: p['ver'] for p in json.load(open('APKINDEX.json'))['pkgs']}
           force = os.environ.get('FORCE', '')
 
           def vercmp(a, b):  # mirror of tools/pack_repo.py
@@ -78,7 +52,7 @@ jobs:
                   return -1 if x < y else 1
               return 0
 
-          def upstream(v):  # strip the -rN packaging revision
+          def upstream(v):  # strip our -rN packaging revision
               return re.sub(r'-r\d+$', '', v)
 
           bumps = []
@@ -106,51 +80,42 @@ jobs:
           print('bumps:', bumps)
           EOF
 
-      - name: install wasi-sdk + node
-        if: steps.gate.outputs.ready == 'true' && steps.oracle.outputs.bumps != '[]'
+      - name: install wasi-sdk
+        if: steps.oracle.outputs.bumps != '[]'
         run: |
           SDK_VER=33
           curl -fsSL -o /tmp/sdk.tar.gz \
             "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-$SDK_VER/wasi-sdk-$SDK_VER.0-x86_64-linux.tar.gz"
-          mkdir -p src/build
-          tar xzf /tmp/sdk.tar.gz -C src/build
-          mv src/build/wasi-sdk-$SDK_VER.0-x86_64-linux src/build/wasi-sdk
+          mkdir -p build
+          tar xzf /tmp/sdk.tar.gz -C build
+          mv build/wasi-sdk-$SDK_VER.0-x86_64-linux build/wasi-sdk
           sudo apt-get install -y ncurses-term
-          cp /usr/share/terminfo/x/xterm src/guest/pkgs/terminfo-xterm || \
-            cp /lib/terminfo/x/xterm src/guest/pkgs/terminfo-xterm
-      - uses: actions/setup-node@v4
-        if: steps.gate.outputs.ready == 'true' && steps.oracle.outputs.bumps != '[]'
-        with:
-          node-version: 24
+          cp /usr/share/terminfo/x/xterm guest/pkgs/terminfo-xterm 2>/dev/null || \
+            cp /lib/terminfo/x/xterm guest/pkgs/terminfo-xterm
 
-      - name: rebuild bumped ports + smoke + publish
-        if: steps.gate.outputs.ready == 'true' && steps.oracle.outputs.bumps != '[]'
+      - name: rebuild bumped ports + publish
+        if: steps.oracle.outputs.bumps != '[]'
         run: |
           set -uo pipefail
-          cd src
-          bash guest/build.sh                       # busybox: run-node's interpreter
+          bash guest/build.sh                       # busybox + libwasicompat (recipes link it)
           FAILED=0
           for row in $(echo '${{ steps.oracle.outputs.bumps }}' | python3 -c "import json,sys; [print(b['name']+'='+b['ver']) for b in json.load(sys.stdin)]"); do
             NAME="${row%%=*}"; VER="${row##*=}"
             echo "=== $NAME $VER ==="
-            # ci_build.sh builds + smokes the port (logic versioned in the source repo,
-            # not this YAML) and leaves a stage/ for pack_repo. Non-zero = build/smoke
-            # failed -> issue + old version keeps serving.
-            if bash tools/ci_build.sh "$NAME" "$VER"; then
-              DESC=$(python3 -c "import json; d=json.load(open('$GITHUB_WORKSPACE/repo/APKINDEX.json')); print(next((p['desc'] for p in d['pkgs'] if p['name']=='$NAME'), '$NAME'))")
-              python3 tools/pack_repo.py --repo "$GITHUB_WORKSPACE/repo" \
-                --name "$NAME" --ver "$VER-r0" --desc "$DESC" --dir "guest/pkgs/$NAME/stage" \
+            if bash tools/ci_build.sh "$NAME" "$VER"; then   # build-only (shim is private)
+              DESC=$(python3 -c "import json; d=json.load(open('APKINDEX.json')); print(next((p['desc'] for p in d['pkgs'] if p['name']=='$NAME'), '$NAME'))")
+              python3 tools/pack_repo.py --repo . --name "$NAME" --ver "$VER-r0" \
+                --desc "$DESC" --dir "guest/pkgs/$NAME/stage" \
                 || { echo "::error::$NAME pack_repo failed"; FAILED=1; }
             else
-              echo "::error::$NAME $VER build/smoke failed"; FAILED=1
+              echo "::error::$NAME $VER build failed"; FAILED=1
             fi
           done
           echo "FAILED=$FAILED" >> "$GITHUB_ENV"
 
-      - name: push published bumps
-        if: steps.gate.outputs.ready == 'true' && steps.oracle.outputs.bumps != '[]'
+      - name: commit + push published bumps
+        if: steps.oracle.outputs.bumps != '[]'
         run: |
-          cd repo
           git config user.name 'os-moap-tracker'
           git config user.email 'tracker@os-moap.invalid'
           git add -A
@@ -160,10 +125,10 @@ jobs:
           echo "published: $(git log -1 --oneline)" >> "$GITHUB_STEP_SUMMARY"
 
       - name: open issue on failure
-        if: steps.gate.outputs.ready == 'true' && env.FAILED == '1'
+        if: env.FAILED == '1'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh issue create -R "$GITHUB_REPOSITORY" \
             -t "track-alpine: port build failed ($(date -u +%F))" \
-            -b "A tracked package bumped in Alpine but the wasm port build or smoke failed. See the run log: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID -- fix the recipe in the source repo, then re-dispatch with force=<pkg>. The old version keeps serving meanwhile."
+            -b "A tracked package bumped in Alpine but the wasm port build failed. Run log: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID -- fix the recipe (in the private source repo, then re-sync) and re-dispatch with force=<pkg>. The old version keeps serving meanwhile."
