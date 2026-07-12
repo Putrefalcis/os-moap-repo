@@ -5,6 +5,7 @@
 #include <sys/types.h>
 #include <errno.h>
 #include <stdio.h>
+#include <time.h>
 #include <string.h>
 #include <unistd.h>
 #include <pwd.h>
@@ -237,4 +238,54 @@ int pclose(FILE *f) {
     (void)f;
     errno = ENOSYS;
     return -1;
+}
+
+/* set*uid/gid family: one pseudo-user (1000/1000), nothing to change. Setting
+ * to the current id succeeds (no-op); anything else is EPERM like an unprivileged
+ * process. (First consumer: zsh's PRIVILEGED-option plumbing, which insists a
+ * uid-change mechanism exists at compile time.) */
+WEAK int setuid(uid_t u)  { if (u == 1000) return 0; errno = EPERM; return -1; }
+WEAK int seteuid(uid_t u) { if (u == 1000) return 0; errno = EPERM; return -1; }
+WEAK int setgid(gid_t g)  { if (g == 1000) return 0; errno = EPERM; return -1; }
+WEAK int setegid(gid_t g) { if (g == 1000) return 0; errno = EPERM; return -1; }
+WEAK int setreuid(uid_t r, uid_t e) {
+    if ((r == (uid_t)-1 || r == 1000) && (e == (uid_t)-1 || e == 1000)) return 0;
+    errno = EPERM; return -1;
+}
+WEAK int setregid(gid_t r, gid_t e) {
+    if ((r == (gid_t)-1 || r == 1000) && (e == (gid_t)-1 || e == 1000)) return 0;
+    errno = EPERM; return -1;
+}
+
+/* ttyname: no /dev in the guest FS, so the name is honest but unopenable --
+ * callers that open() it fall through to their dup(0) fallbacks (zsh init_io,
+ * less open_tty). isatty() is the real signal here. */
+WEAK char *ttyname(int fd) { return isatty(fd) ? (char *)"/dev/tty" : NULL; }
+
+/* tty process group: one process group, and it owns the one terminal. Setting
+ * it "succeeds", reading it returns our own pgrp -- job-control code (zsh
+ * attachtty/gettygrp) then correctly believes it's the foreground group. */
+WEAK int tcsetpgrp(int fd, pid_t pgrp) { (void)fd; (void)pgrp; return 0; }
+WEAK pid_t tcgetpgrp(int fd) { (void)fd; return getpgrp(); }
+WEAK pid_t setpgrp(void) { return 0; }
+WEAK int setpgid(pid_t p, pid_t g) { (void)p; (void)g; return 0; }  /* one pgroup */
+
+/* alarm: nothing can deliver SIGALRM (no async signals) -- arming a timer is a
+ * silent no-op (zsh TMOUT / zle timeouts simply never fire). */
+WEAK unsigned alarm(unsigned s) { (void)s; return 0; }
+
+/* pause: waiting for a signal would deadlock a single-threaded wasm world.
+ * Pretend one arrived immediately -- callers loop and re-check their state. */
+WEAK int pause(void) { errno = EINTR; return -1; }
+
+/* mktemp: name-only variant of mkstemp (callers open with O_EXCL themselves).
+ * Wall-clock nanoseconds mixed in so separate instances (parent vs spawned
+ * child, each with fresh statics) don't mint the same name. */
+WEAK char *mktemp(char *tmpl) {
+    size_t n = strlen(tmpl); static unsigned seq = 0;
+    struct timespec ts = {0, 0};
+    clock_gettime(CLOCK_REALTIME, &ts);
+    unsigned v = (unsigned)ts.tv_nsec ^ (++seq * 2654435761u);
+    if (n >= 6) for (int i = 0; i < 6; i++) { tmpl[n-1-i] = 'a' + (v % 26); v /= 26; }
+    return tmpl;
 }

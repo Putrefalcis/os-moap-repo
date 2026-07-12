@@ -39,5 +39,10 @@
     "alpine": "sqlite",
     "branch": "edge",
     "repo": "main"
+  },
+  "zsh": {
+    "alpine": "zsh",
+    "branch": "edge",
+    "repo": "main"
   }
 }

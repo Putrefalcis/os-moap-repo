@@ -17,7 +17,19 @@ char *getlogin(void);
 int getdtablesize(void);
 int pipe(int fds[2]);
 pid_t setsid(void);
+pid_t setpgrp(void);
+pid_t getpgrp(void);
+int getpgid(pid_t pid);
 int getgroups(int size, gid_t *list);
+char *ttyname(int fd);
+int tcsetpgrp(int fd, pid_t pgrp);
+pid_t tcgetpgrp(int fd);
+int setuid(uid_t u);
+int seteuid(uid_t u);
+int setgid(gid_t g);
+int setegid(gid_t g);
+int setreuid(uid_t r, uid_t e);
+int setregid(gid_t r, gid_t e);
 #ifdef __cplusplus
 }
 #endif

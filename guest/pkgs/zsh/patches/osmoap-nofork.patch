@@ -1,0 +1,547 @@
+diff --color -ruN '--exclude=.osd-ver' /tmp/claude-1000/-home-dkay-src-sl-LSL-OS-MOAP/c281ec76-869b-44ff-bc5c-bc34ff582710/scratchpad/zsh-pristine/Src/builtin.c zsh-upstream/Src/builtin.c
+--- a/Src/builtin.c	2022-05-08 08:18:22.000000000 +0200
++++ b/Src/builtin.c	2026-07-12 16:09:54.304517763 +0200
+@@ -5825,6 +5825,15 @@
+      * a later value always overrides an earlier.
+      */
+     exit_val = val;
++    /* OS-MOAP: `exit` inside an in-process $(...) unwinds the substitution,
++     * not the shell -- a forked child would simply have died with `val`. */
++    if (osd_insubst) {
++	lastval = val;
++	osd_insubst_exit = 1;
++	retflag = 1;
++	breaks = loops;
++	return;
++    }
+     if (shell_exiting == -1) {
+ 	retflag = 1;
+ 	breaks = loops;
+diff --color -ruN '--exclude=.osd-ver' /tmp/claude-1000/-home-dkay-src-sl-LSL-OS-MOAP/c281ec76-869b-44ff-bc5c-bc34ff582710/scratchpad/zsh-pristine/Src/exec.c zsh-upstream/Src/exec.c
+--- a/Src/exec.c	2022-05-08 08:18:22.000000000 +0200
++++ b/Src/exec.c	2026-07-12 16:12:23.430002152 +0200
+@@ -456,6 +456,33 @@
+     return lastval;
+ }
+ 
++/* OS-MOAP (wasm32-wasip1): there is no fork or execve.  External commands run
++ * via the host's __osd_spawn (osd_spawn() in libwasicompat): the host runs the
++ * file as a fresh wasm instance sharing our FS and live fds while this shell
++ * stays suspended, and hands back the exit status.  osd_nofork marks "the
++ * shell continues after this command" -- execute()/zexecve() then RETURN the
++ * status (parked in osd_spawn_st) instead of never returning; without it a
++ * successful spawn exits the shell with the child's status, which is exactly
++ * `exec cmd` semantics.  See guest/busybox/patches/README.md patch 6 for the
++ * ash-side twin of this design. */
++static int osd_nofork;
++static int osd_spawn_st = -1;
++
++/* OS-MOAP: depth of in-process command substitution.  zexit() consults it so
++ * `exit` inside $(...) unwinds the substitution instead of killing the shell
++ * (a forked child would just have died). */
++
++/**/
++mod_export int osd_insubst;
++
++/* OS-MOAP: set by the zexit() guard -- `exit N` happened inside the current
++ * in-process substitution; the N itself is in exit_val (zexit stores it
++ * before anything else).  Needed because the exit builtin still returns 0
++ * through execbuiltin, clobbering lastval during the unwind. */
++
++/**/
++mod_export int osd_insubst_exit;
++
+ /* execve after handling $_ and #! */
+ 
+ #define POUNDBANGLIMIT 128
+@@ -485,6 +512,24 @@
+ 
+     if (newenvp == NULL)
+ 	    newenvp = environ;
++    /* OS-MOAP: spawn instead of execve.  Script/hashbang/wasm dispatch is
++     * HOST-side (web/wasi/spawn.mjs), so the ENOEXEC machinery below stays
++     * dormant.  st >= 0 is the child's exit status; st < 0 is -errno (e.g.
++     * -ENOENT for a missing PATH candidate, which keeps execute()'s path
++     * walk honest). */
++    {
++	extern int osd_spawn(const char *p, char *const av[], char *const ep[]);
++	int st = osd_spawn(pth, argv, newenvp);
++	if (st >= 0) {
++	    if (!osd_nofork)
++		_exit(st);	/* `exec cmd`: the shell is done */
++	    osd_spawn_st = st;
++	    eno = 0;
++	    goto osd_out;
++	}
++	eno = errno;		/* osd_spawn: -1 with errno set, like execve */
++	goto osd_out;
++    }
+     winch_unblock();
+     execve(pth, argv, newenvp);
+ 
+@@ -584,6 +629,7 @@
+     /* restore the original arguments and path but do not bother with *
+      * null characters as these cannot be passed to external commands *
+      * anyway.  So the result is truncated at the first null char.    */
++  osd_out:
+     pth = metafy(pth, -1, META_NOALLOC);
+     for (eep = argv; *eep; eep++)
+ 	if (*eep != pth)
+@@ -666,6 +712,16 @@
+ 
+ /* execute an external command */
+ 
++/* OS-MOAP: in osd_nofork mode every "exit with status" in execute() becomes
++ * "set lastval and return" -- the shell survives the external command.  The
++ * zerr()s on these paths ("command not found" etc.) would have happened in a
++ * doomed forked child; the parent only ever saw the status, so drop the
++ * error bit (keep interrupts) or the whole surrounding list would abort. */
++#define OSD_SPAWNED() do { if (osd_nofork && osd_spawn_st >= 0) { \
++	lastval = osd_spawn_st; osd_spawn_st = -1; return; } } while (0)
++#define OSD_EXIT(n) do { if (osd_nofork) { lastval = (n); \
++	errflag &= ~ERRFLAG_ERROR; return; } _exit(n); } while (0)
++
+ /**/
+ static void
+ execute(LinkList args, int flags, int defpath)
+@@ -679,7 +735,7 @@
+     arg0 = (char *) peekfirst(args);
+     if (isset(RESTRICTED) && (strchr(arg0, '/') || defpath)) {
+ 	zerr("%s: restricted", arg0);
+-	_exit(1);
++	OSD_EXIT(1);
+     }
+ 
+     /* If the parameter STTY is set in the command's environment, *
+@@ -738,16 +794,17 @@
+     child_unblock();
+     if ((int) strlen(arg0) >= PATH_MAX) {
+ 	zerr("command too long: %s", arg0);
+-	_exit(1);
++	OSD_EXIT(1);
+     }
+     for (s = arg0; *s; s++)
+ 	if (*s == '/') {
+ 	    int lerrno = zexecve(arg0, argv, newenvp);
++	    OSD_SPAWNED();
+ 	    if (arg0 == s || unset(PATHDIRS) ||
+ 		(arg0[0] == '.' && (arg0 + 1 == s ||
+ 				    (arg0[1] == '.' && arg0 + 2 == s)))) {
+ 		zerr("%e: %s", lerrno, arg0);
+-		_exit((lerrno == EACCES || lerrno == ENOEXEC) ? 126 : 127);
++		OSD_EXIT((lerrno == EACCES || lerrno == ENOEXEC) ? 126 : 127);
+ 	    }
+ 	    break;
+ 	}
+@@ -758,14 +815,19 @@
+ 	char *dptr;
+ 
+ 	if (!search_defpath(arg0, pbuf, PATH_MAX)) {
+-	    if (commandnotfound(arg0, args) == 0)
++	    if (commandnotfound(arg0, args) == 0) {
++		if (osd_nofork)
++		    return;	/* handler ran in-process; lastval is its status */
+ 		_realexit();
++	    }
+ 	    zerr("command not found: %s", arg0);
+-	    _exit(127);
++	    OSD_EXIT(127);
+ 	}
+ 
+ 	ee = zexecve(pbuf, argv, newenvp);
+ 
++	OSD_SPAWNED();
++
+ 	if ((dptr = strrchr(pbuf, '/')))
+ 	    *dptr = '\0';
+ 	if (isgooderr(ee, *pbuf ? pbuf : "/"))
+@@ -782,6 +844,7 @@
+ 		for (pp = path; pp < cn->u.name; pp++)
+ 		    if (!**pp || (**pp == '.' && (*pp)[1] == '\0')) {
+ 			ee = zexecve(arg0, argv, newenvp);
++			OSD_SPAWNED();
+ 			if (isgooderr(ee, *pp))
+ 			    eno = ee;
+ 		    } else if (**pp != '/') {
+@@ -790,6 +853,7 @@
+ 			*z++ = '/';
+ 			strcpy(z, arg0);
+ 			ee = zexecve(buf, argv, newenvp);
++			OSD_SPAWNED();
+ 			if (isgooderr(ee, *pp))
+ 			    eno = ee;
+ 		    }
+@@ -798,6 +862,7 @@
+ 		strcat(nn, cn->node.nam);
+ 	    }
+ 	    ee = zexecve(nn, argv, newenvp);
++	    OSD_SPAWNED();
+ 
+ 	    if ((dptr = strrchr(nn, '/')))
+ 		*dptr = '\0';
+@@ -807,6 +872,7 @@
+ 	for (pp = path; *pp; pp++)
+ 	    if (!(*pp)[0] || ((*pp)[0] == '.' && !(*pp)[1])) {
+ 		ee = zexecve(arg0, argv, newenvp);
++		OSD_SPAWNED();
+ 		if (isgooderr(ee, *pp))
+ 		    eno = ee;
+ 	    } else {
+@@ -815,6 +881,7 @@
+ 		*z++ = '/';
+ 		strcpy(z, arg0);
+ 		ee = zexecve(buf, argv, newenvp);
++		OSD_SPAWNED();
+ 		if (isgooderr(ee, *pp))
+ 		    eno = ee;
+ 	    }
+@@ -822,11 +889,13 @@
+ 
+     if (eno)
+ 	zerr("%e: %s", eno, arg0);
+-    else if (commandnotfound(arg0, args) == 0)
++    else if (commandnotfound(arg0, args) == 0) {
++	if (osd_nofork)
++	    return;		/* handler ran in-process; lastval is its status */
+ 	_realexit();
+-    else
++    } else
+ 	zerr("command not found: %s", arg0);
+-    _exit((eno == EACCES || eno == ENOEXEC) ? 126 : 127);
++    OSD_EXIT((eno == EACCES || eno == ENOEXEC) ? 126 : 127);
+ }
+ 
+ #define RET_IF_COM(X) { if (iscom(X)) return docopy ? dupstring(X) : arg0; }
+@@ -1966,8 +2035,24 @@
+ 	++state->pc;
+ 	execcmd_analyse(state, &eparams);
+ 
+-	if (mpipe(pipes) < 0) {
+-	    /* FIXME */
++	/* OS-MOAP: no fork => no concurrent pipe.  Thread the stages
++	 * SEQUENTIALLY through an unlinked temp file: stage N runs to
++	 * completion writing pipes[1], then stage N+1 reads pipes[0] (opened
++	 * at offset 0 on the same node; the unlink means the fds own it).
++	 * Same architecture as busybox-ash patch 2.  Everything downstream
++	 * (execcmd_exec's input/output plumbing, zsh's run-the-last-stage-
++	 * in-the-shell rule, so `... | read v` works) is unchanged. */
++	{
++	    static unsigned osd_plseq;
++	    char osd_tnam[48];
++	    sprintf(osd_tnam, "/tmp/.osdzp%u", ++osd_plseq);
++	    pipes[1] = open(osd_tnam, O_WRONLY | O_CREAT | O_TRUNC, 0600);
++	    pipes[0] = open(osd_tnam, O_RDONLY | O_NOCTTY);
++	    unlink(osd_tnam);
++	    if (pipes[0] < 0 || pipes[1] < 0) {
++		zerr("pipe failed: %e", errno);
++		return;
++	    }
+ 	}
+ 
+ 	addfilelist(NULL, pipes[0]);
+@@ -2907,8 +2992,14 @@
+ 	    pushnode(args, dupstring("fg"));
+     }
+ 
+-    if ((how & Z_ASYNC) || output ||
+-	(last1 == 2 && input && EMULATION(EMULATE_SH))) {
++    /* OS-MOAP: upstream also early-forks for `output` (non-last pipeline
++     * stage) and sh-mode tails.  Our pipeline is sequential temp files, so
++     * those stages run right here in the shell -- externals spawn via
++     * osd_nofork, builtins run in-process with fd 1 redirected.  KNOWN LEAK
++     * (same family as the ash port): assignments/cd in non-last pipeline
++     * stages persist in the shell.  Only true background jobs still try to
++     * fork, failing honestly in zfork(). */
++    if (how & Z_ASYNC) {
+ 	/*
+ 	 * If running in the background, not the last command in a
+ 	 * pipeline, or the last command in a multi-stage pipeline
+@@ -3572,16 +3663,36 @@
+ 	    (((is_builtin || is_shfunc) && output) ||
+ 	     (!is_cursh && (last1 != 1 || nsigtrapped || havefiles() ||
+ 			    fdtable_flocks)))) {
+-	    switch (execcmd_fork(state, how, type, varspc, &filelist,
+-				 text, oautocont, close_if_forked)) {
+-	    case -1:
+-		goto fatal;
+-	    case 0:
+-		break;
+-	    default:
+-		return;
++	    /* OS-MOAP: this arm is "we must fork" -- but wasm can't.  Two
++	     * no-fork substitutes, mirroring busybox-ash patches 2+6:
++	     *  - builtin/function with piped output: just run it in-process;
++	     *    execpline threads temp files, not live pipes, so writing the
++	     *    redirected fd 1 to completion IS the pipe semantics.
++	     *  - external command: run via host spawn with the shell
++	     *    suspended.  osd_nofork makes execute() return the status
++	     *    instead of exiting; redirections were applied in-shell with
++	     *    save[] and are restored by fixfds() as for builtins.
++	     * Anything that truly needs a live subshell (bg jobs, coproc,
++	     * process substitution) still reaches zfork() and errors. */
++	    if (!is_cursh) {
++		if (type == WC_SIMPLE || type == WC_TYPESET)
++		    osd_nofork = 1;
++		else {
++		    /* (...) etc. want a real isolated subshell; running the
++		     * body in the parent would silently leak all its state.
++		     * Refuse like a failed fork (the ash capability bar). */
++		    errno = ENOSYS;
++		    zerr("fork failed: %e (no subshells on this CPU)", errno);
++		    lastval = 1;
++		    goto fatal;
++		}
++	    } else {
++		jobtab[thisjob].stat |= STAT_CURSH;
++		if (!jobtab[thisjob].procs)
++		    jobtab[thisjob].stat |= STAT_NOPRINT;
++		if (is_builtin)
++		    jobtab[thisjob].stat |= STAT_BUILTIN;
+ 	    }
+-	    forked = 1;
+ 	} else if (is_cursh) {
+ 	    /* This is a current shell procedure that didn't need to fork.    *
+ 	     * This includes current shell procedures that are being exec'ed, *
+@@ -4189,7 +4300,13 @@
+ 		restore_params(restorelist, removelist);
+ 
+ 	} else {
+-	    if (!subsh) {
++	    /* OS-MOAP: under osd_nofork the shell SURVIVES the external
++	     * command, so skip everything that assumes this process is about
++	     * to become / die with the child: SHLVL bookkeeping, internal-fd
++	     * closes, coproc teardown.  KNOWN LEAK (same family as the ash
++	     * port): `VAR=x extcmd` exports VAR for the spawn and does not
++	     * restore it afterwards. */
++	    if (!subsh && !osd_nofork) {
+ 	        /* for either implicit or explicit "exec", decrease $SHLVL
+ 		 * as we're now done as a shell */
+ 		if (!forked)
+@@ -4206,17 +4323,25 @@
+ 		    if (forked)
+ 			addflags |= ADDVAR_RESTORE;
+ 		    addvars(state, varspc, addflags);
+-		    if (errflag)
++		    if (errflag) {
++			if (osd_nofork) {
++			    osd_nofork = 0;
++			    lastval = 1;
++			    goto err;
++			}
+ 			_exit(1);
++		    }
+ 		}
+-		closem(FDT_INTERNAL, 0);
+-		if (coprocin != -1) {
+-		    zclose(coprocin);
+-		    coprocin = -1;
+-		}
+-		if (coprocout != -1) {
+-		    zclose(coprocout);
+-		    coprocout = -1;
++		if (!osd_nofork) {
++		    closem(FDT_INTERNAL, 0);
++		    if (coprocin != -1) {
++			zclose(coprocin);
++			coprocin = -1;
++		    }
++		    if (coprocout != -1) {
++			zclose(coprocout);
++			coprocout = -1;
++		    }
+ 		}
+ #ifdef HAVE_GETRLIMIT
+ 		if (!forked)
+@@ -4227,6 +4352,10 @@
+ 		    STTYval = 0;
+ 		}
+ 		execute(args, cflags, use_defpath);
++		/* OS-MOAP: only reached in osd_nofork mode (otherwise execute
++		 * never returns); lastval already carries the child status and
++		 * the err: tail below restores the saved fds via fixfds(). */
++		osd_nofork = 0;
+ 	    } else {		/* ( ... ) */
+ 		DPUTS(varspc,
+ 		      "BUG: assignment before complex command");
+@@ -4658,44 +4787,66 @@
+ 	}
+ 	return retval;
+     }
+-    if (mpipe(pipes) < 0) {
+-	errflag |= ERRFLAG_ERROR;
+-	cmdoutpid = 0;
+-	return NULL;
+-    }
+-    child_block();
+-    cmdoutval = 0;
+-    if ((cmdoutpid = pid = zfork(NULL)) == -1) {
+-	/* fork error */
+-	zclose(pipes[0]);
+-	zclose(pipes[1]);
+-	errflag |= ERRFLAG_ERROR;
+-	cmdoutpid = 0;
+-	child_unblock();
+-	return NULL;
+-    } else if (pid) {
++    /* OS-MOAP: no fork -- run the substitution IN THIS SHELL with fd 1
++     * redirected to an unlinked temp file, then read that back.  This is the
++     * zsh twin of busybox-ash patch 5, but zsh's execode() is designed for
++     * in-process nesting (eval/traps/functions use it), so only the loop/
++     * return control state needs isolating.  KNOWN LEAK (documented, same as
++     * the ash port): variable assignments inside $(...) persist in the
++     * parent.  `exit` inside $(...) is contained by the osd_insubst guard in
++     * zexit(). */
++    {
+ 	LinkList retval;
+-
+-	zclose(pipes[1]);
+-	retval = readoutput(pipes[0], qt, NULL);
+-	fdtable[pipes[0]] = FDT_UNUSED;
+-	waitforpid(pid, 0);		/* unblocks */
+-	lastval = cmdoutval;
++	char *tnam;
++	int wfd, rfd, old1;
++	int obreaks = breaks, oretflag = retflag, ocontflag = contflag;
++
++	(void)pid; (void)pipes;
++	if (!(tnam = gettempname(NULL, 1)) ||
++	    (wfd = open(unmeta(tnam), O_WRONLY | O_CREAT | O_EXCL | O_NOCTTY,
++			0600)) < 0) {
++	    errflag |= ERRFLAG_ERROR;
++	    cmdoutpid = 0;
++	    return NULL;
++	}
++	rfd = open(unmeta(tnam), O_RDONLY | O_NOCTTY);
++	unlink(unmeta(tnam));
++	if (rfd < 0) {
++	    close(wfd);
++	    errflag |= ERRFLAG_ERROR;
++	    cmdoutpid = 0;
++	    return NULL;
++	}
++	cmdoutpid = 0;
++	cmdoutval = 0;
++	fflush(stdout);
++	clearerr(stdout);
++	old1 = movefd(1);
++	redup(wfd, 1);
++	osd_insubst++;
++	cmdpush(CS_CMDSUBST);
++	execode(prog, 0, 1, "cmdsubst");
++	cmdpop();
++	osd_insubst--;
++	fflush(stdout);
++	clearerr(stdout);
++	redup(old1, 1);
++	/* contain loop/return control flow like a forked child would */
++	breaks = obreaks;
++	retflag = oretflag;
++	contflag = ocontflag;
++	retval = readoutput(rfd, qt, NULL);
++	fdtable[rfd] = FDT_UNUSED;
++	/* lastval was set by execode -- exactly the child's exit status --
++	 * except after `exit N`, whose builtin return clobbers it with 0
++	 * during the unwind; exit_val carries the true N. */
++	if (osd_insubst_exit) {
++	    osd_insubst_exit = 0;
++	    lastval = exit_val;
++	}
++	cmdoutval = lastval;
+ 	return retval;
+     }
+-    /* pid == 0 */
+-    child_unblock();
+-    zclose(pipes[0]);
+-    redup(pipes[1], 1);
+-    entersubsh(ESUB_PGRP|ESUB_NOMONITOR, NULL);
+-    cmdpush(CS_CMDSUBST);
+-    execode(prog, 0, 1, "cmdsubst");
+-    cmdpop();
+-    close(1);
+-    _realexit();
+-    zerr("exit returned in child!!");
+-    kill(getpid(), SIGKILL);
+-    return NULL;
+ }
+ 
+ /* read output of command substitution
+diff --color -ruN '--exclude=.osd-ver' /tmp/claude-1000/-home-dkay-src-sl-LSL-OS-MOAP/c281ec76-869b-44ff-bc5c-bc34ff582710/scratchpad/zsh-pristine/Src/jobs.c zsh-upstream/Src/jobs.c
+--- a/Src/jobs.c	2022-05-08 08:18:22.000000000 +0200
++++ b/Src/jobs.c	2026-07-12 16:09:54.305277899 +0200
+@@ -1029,7 +1029,9 @@
+ 	    return 1;
+ #else
+ 	{
+-	    clktck = get_clktck();
++	    /* OS-MOAP: upstream bitrot in the !HAVE_GETRUSAGE branch -- clktck
++	     * was never declared here (every modern libc has getrusage). */
++	    long clktck = get_clktck();
+ 	    if ((j->procs->ti.ut + j->procs->ti.st) / clktck >= reporttime)
+ 		return 1;
+ 	}
+diff --color -ruN '--exclude=.osd-ver' /tmp/claude-1000/-home-dkay-src-sl-LSL-OS-MOAP/c281ec76-869b-44ff-bc5c-bc34ff582710/scratchpad/zsh-pristine/Src/signals.c zsh-upstream/Src/signals.c
+--- a/Src/signals.c	2022-05-08 08:18:22.000000000 +0200
++++ b/Src/signals.c	2026-07-12 16:09:54.305446623 +0200
+@@ -617,8 +617,10 @@
+     /* Traps can cause nested signal_suspend()  */
+     if (sig == SIGCHLD) {
+         if (do_jump) {
+-	    /* Copy suspend_jmp_buf                    */
+-            jump_to = suspend_jmp_buf;
++	    /* Copy suspend_jmp_buf. OS-MOAP: upstream bitrot -- jmp_buf is an
++	     * array type, not assignable; this branch predates every libc in
++	     * use. memcpy is the same copy the assignment intended. */
++            memcpy(jump_to, suspend_jmp_buf, sizeof(signal_jmp_buf));
+ 	}
+     }
+ #endif
+diff --color -ruN '--exclude=.osd-ver' /tmp/claude-1000/-home-dkay-src-sl-LSL-OS-MOAP/c281ec76-869b-44ff-bc5c-bc34ff582710/scratchpad/zsh-pristine/Src/Zle/complete.c zsh-upstream/Src/Zle/complete.c
+--- a/Src/Zle/complete.c	2022-05-08 08:18:22.000000000 +0200
++++ b/Src/Zle/complete.c	2026-07-12 16:09:54.305570666 +0200
+@@ -1750,6 +1750,22 @@
+     return handlefeatures(m, &module_features, enables);
+ }
+ 
++/* OS-MOAP (wasm32): hooks are invoked indirectly as Hookfn
++ * (int (*)(Hookdef, void *)).  Registering an arity-0 function through the
++ * (Hookfn) cast works on native ABIs but is an indirect-call signature
++ * mismatch -- an immediate trap -- on wasm.  Wrap the two zero-arg targets. */
++static int
++osd_accept_last_hook(UNUSED(Hookdef dummy), UNUSED(void *dat))
++{
++    return accept_last();
++}
++
++static int
++osd_invalidate_list_hook(UNUSED(Hookdef dummy), UNUSED(void *dat))
++{
++    return invalidate_list();
++}
++
+ /**/
+ int
+ boot_(Module m)
+@@ -1757,9 +1773,9 @@
+     addhookfunc("complete", (Hookfn) do_completion);
+     addhookfunc("before_complete", (Hookfn) before_complete);
+     addhookfunc("after_complete", (Hookfn) after_complete);
+-    addhookfunc("accept_completion", (Hookfn) accept_last);
++    addhookfunc("accept_completion", (Hookfn) osd_accept_last_hook);
+     addhookfunc("list_matches", (Hookfn) list_matches);
+-    addhookfunc("invalidate_list", (Hookfn) invalidate_list);
++    addhookfunc("invalidate_list", (Hookfn) osd_invalidate_list_hook);
+     (void)addhookdefs(m, comphooks, sizeof(comphooks)/sizeof(*comphooks));
+     return addwrapper(m, wrapper);
+ }
+@@ -1771,9 +1787,9 @@
+     deletehookfunc("complete", (Hookfn) do_completion);
+     deletehookfunc("before_complete", (Hookfn) before_complete);
+     deletehookfunc("after_complete", (Hookfn) after_complete);
+-    deletehookfunc("accept_completion", (Hookfn) accept_last);
++    deletehookfunc("accept_completion", (Hookfn) osd_accept_last_hook);
+     deletehookfunc("list_matches", (Hookfn) list_matches);
+-    deletehookfunc("invalidate_list", (Hookfn) invalidate_list);
++    deletehookfunc("invalidate_list", (Hookfn) osd_invalidate_list_hook);
+     (void)deletehookdefs(m, comphooks,
+ 			 sizeof(comphooks)/sizeof(*comphooks));
+     deletewrapper(m, wrapper);
